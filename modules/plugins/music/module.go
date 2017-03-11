@@ -1,108 +1,28 @@
-package plugins
+package music
 
 import (
-    "bufio"
-    "encoding/binary"
+    "strings"
+    "github.com/bwmarrin/discordgo"
+    "os"
+    "regexp"
     "fmt"
+    "strconv"
+    "os/exec"
+    "github.com/Jeffail/gabs"
+    Logger "git.lukas.moe/sn0w/Karen/logger"
+    "time"
+    "io/ioutil"
     "git.lukas.moe/sn0w/Karen/cache"
     "git.lukas.moe/sn0w/Karen/helpers"
-    Logger "git.lukas.moe/sn0w/Karen/logger"
-    "github.com/Jeffail/gabs"
-    "github.com/bwmarrin/discordgo"
     rethink "github.com/gorethink/gorethink"
-    "io"
-    "io/ioutil"
-    "os"
-    "os/exec"
-    "regexp"
-    "strconv"
-    "strings"
-    "sync"
-    "time"
 )
 
-// Define control messages
-type controlMessage int
-
-const (
-    Skip   controlMessage = iota
-    Pause
-    Resume
-)
-
-// A connection to one guild's channel
-type GuildConnection struct {
-    sync.RWMutex
-
-    // Controller channel for Skip/Pause/Resume
-    controller chan controlMessage
-
-    // Closer channel for Stop commands
-    closer chan struct{}
-
-    // Slice of waiting songs
-    playlist []Song
-
-    // Slice of waiting but unprocessed songs
-    queue []Song
-
-    // Whether this is playing music or not
-    playing bool
-
-    // A lock that stops the autoleaver while disconnecting
-    leaveLock sync.RWMutex
-}
-
-// Helper to generate a guild connection
-func (gc *GuildConnection) Alloc() *GuildConnection {
-    gc.Lock()
-    gc.playlist = []Song{}
-    gc.queue = []Song{}
-    gc.playing = false
-    gc.Unlock()
-
-    gc.CreateChannels()
-
-    return gc
-}
-
-func (gc *GuildConnection) CloseChannels() {
-    gc.Lock()
-    close(gc.closer)
-    close(gc.controller)
-    gc.Unlock()
-}
-
-func (gc *GuildConnection) CreateChannels() {
-    gc.Lock()
-    gc.closer = make(chan struct{})
-    gc.controller = make(chan controlMessage)
-    gc.Unlock()
-}
-
-func (gc *GuildConnection) RecreateChannels() {
-    gc.CloseChannels()
-    gc.CreateChannels()
-}
-
-// Define a song
-type Song struct {
-    ID        string `gorethink:"id,omitempty"`
-    AddedBy   string `gorethink:"added_by"`
-    Title     string `gorethink:"title"`
-    URL       string `gorethink:"url"`
-    Duration  int    `gorethink:"duration"`
-    Processed bool   `gorethink:"processed"`
-    Path      string `gorethink:"path"`
-}
-
-// Plugin class
-type Music struct {
+type Module struct {
     guildConnections map[string]*GuildConnection
     enabled          bool
 }
 
-func (m *Music) Commands() []string {
+func (m *Module) Commands() []string {
     return []string{
         "join",
         "leave",
@@ -127,7 +47,7 @@ func (m *Music) Commands() []string {
     }
 }
 
-func (m *Music) Init(session *discordgo.Session) {
+func (m *Module) Init(session *discordgo.Session) {
     m.enabled = false
     foundYTD, foundFFPROBE, foundFFMPEG, foundRopus := false, false, false, false
 
@@ -165,17 +85,17 @@ func (m *Music) Init(session *discordgo.Session) {
 
         // Start loop that processes videos in background
         Logger.PLUGIN.L("music", "Starting async processor loop")
-        go m.processorLoop()
+        go processorLoop()
 
         // Start janitor that removes files which are not tracked in the DB
         Logger.PLUGIN.L("music", "Starting async janitor")
-        go m.janitor()
+        go janitor()
     } else {
         Logger.PLUGIN.L("music", "Not Found. Music disabled!")
     }
 }
 
-func (m *Music) Action(command string, content string, msg *discordgo.Message, session *discordgo.Session) {
+func (m *Module) Action(command string, content string, msg *discordgo.Message, session *discordgo.Session) {
     // Only continue if enabled
     if !m.enabled {
         return
@@ -615,371 +535,8 @@ func (m *Music) Action(command string, content string, msg *discordgo.Message, s
     }
 }
 
-// Waits until the song is ready and notifies.
-func (m *Music) waitForSong(channel string, guild string, match Song, msg *discordgo.Message, session *discordgo.Session) {
-    defer helpers.RecoverDiscord(msg)
-
-    queue := &m.guildConnections[guild].queue
-    playlist := &m.guildConnections[guild].playlist
-
-    for {
-        time.Sleep(1 * time.Second)
-
-        cursor, err := rethink.Table("music").Filter(map[string]interface{}{"url": match.URL}).Run(helpers.GetDB())
-        helpers.Relax(err)
-
-        var res Song
-        err = cursor.One(&res)
-        helpers.Relax(err)
-        cursor.Close()
-
-        if res.Processed {
-            // Remove from queue
-            for idx, song := range *queue {
-                if song.URL == match.URL {
-                    m.guildConnections[guild].Lock()
-                    *queue = append((*queue)[:idx], (*queue)[idx+1:]...)
-                    m.guildConnections[guild].Unlock()
-                }
-            }
-
-            // Add to playlist
-            m.guildConnections[guild].Lock()
-            *playlist = append(*playlist, res)
-            m.guildConnections[guild].Unlock()
-
-            session.ChannelMessageSend(channel, ":ballot_box_with_check: `"+res.Title+"` finished downloading :smiley:")
-            break
-        }
-    }
-}
-
-// Resolves a voice channel relative to a user id
-func (m *Music) resolveVoiceChannel(user *discordgo.User, guild *discordgo.Guild, session *discordgo.Session) *discordgo.Channel {
-    for _, vs := range guild.VoiceStates {
-        if vs.UserID == user.ID {
-            channel, err := session.Channel(vs.ChannelID)
-            if err != nil {
-                return nil
-            }
-
-            return channel
-        }
-    }
-
-    return nil
-}
-
-// processorLoop is a endless coroutine that checks for new songs and spawns youtube-dl as needed
-func (m *Music) processorLoop() {
-    defer func() {
-        helpers.Recover()
-
-        Logger.ERROR.L("music", "The processorLoop died. Please investigate!")
-        time.Sleep(5 * time.Second)
-        go m.processorLoop()
-    }()
-
-    // Define vars once and override later as needed
-    var err error
-    var cursor *rethink.Cursor
-
-    for {
-        // Sleep before next iteration
-        time.Sleep(5 * time.Second)
-
-        // Get unprocessed items
-        cursor, err = rethink.Table("music").Filter(map[string]interface{}{"processed": false}).Run(helpers.GetDB())
-        helpers.Relax(err)
-
-        // Get song objects
-        var songs []Song
-        err = cursor.All(&songs)
-        helpers.Relax(err)
-        cursor.Close()
-
-        // If there are no results skip this iteration
-        if err == rethink.ErrEmptyResult || len(songs) == 0 {
-            continue
-        }
-
-        Logger.INFO.L("music", "Found "+strconv.Itoa(len(songs))+" unprocessed items!")
-
-        // Loop through songs
-        for _, song := range songs {
-            start := time.Now().Unix()
-
-            name := helpers.BtoA(song.URL)
-
-            Logger.INFO.L("music", "Downloading "+song.URL+" as "+name)
-
-            // Download with youtube-dl
-            ytdl := exec.Command(
-                "youtube-dl",
-                "--abort-on-error",
-                "--no-color",
-                "--no-playlist",
-                "--max-filesize", "1024m",
-                "-f", "bestaudio/best[height<=720][fps<=30]/best[height<=720]/[abr<=192]",
-                "-x",
-                "--audio-format", "wav",
-                "--audio-quality", "0",
-                "-o", name+".%(ext)s",
-                "--exec", "mv {} /srv/karen-data",
-                song.URL,
-            )
-            ytdl.Stdout = os.Stdout
-            ytdl.Stderr = os.Stderr
-            helpers.Relax(ytdl.Start())
-            helpers.Relax(ytdl.Wait())
-
-            // WAV => RAW OPUS
-            cstart := time.Now().Unix()
-            Logger.INFO.L("music", "PCM => ROPUS | "+name)
-
-            // Create file
-            opusFile, err := os.Create("/srv/karen-data/" + name + ".ro")
-            helpers.Relax(err)
-            writer := bufio.NewWriter(opusFile)
-
-            // Read wav
-            cat := exec.Command(
-                "ffmpeg",
-                "-i", "/srv/karen-data/"+name+".wav",
-                "-f", "s16le",
-                "-ar", "48000",
-                "-ac", "2",
-                "-v", "128",
-                "pipe:1",
-            )
-
-            // Convert wav to raw opus
-            ro := exec.Command("ropus")
-
-            // Pipe streams
-            r, w := io.Pipe()
-            cat.Stdout = w
-            ro.Stdin = r
-            ro.Stdout = writer
-
-            // Run commands
-            helpers.Relax(cat.Start())
-            helpers.Relax(ro.Start())
-
-            // Wait until cat loaded the whole file
-            helpers.Relax(cat.Wait())
-            w.Close()
-
-            // Wait until the file is converted
-            helpers.Relax(ro.Wait())
-            r.Close()
-            opusFile.Close()
-            cend := time.Now().Unix()
-
-            // Cleanup
-            helpers.Relax(os.Remove("/srv/karen-data/" + name + ".wav"))
-
-            // Mark as processed
-            song.Processed = true
-            song.Path = "/srv/karen-data/" + name + ".ro"
-
-            // Update db
-            _, err = rethink.Table("music").
-                Filter(map[string]interface{}{"id": song.ID}).
-                Update(song).
-                RunWrite(helpers.GetDB())
-            helpers.Relax(err)
-
-            end := time.Now().Unix()
-            Logger.INFO.L(
-                "music",
-                "Download took "+strconv.Itoa(int(end-start))+"s "+"| Conversion took "+strconv.Itoa(int(cend-cstart))+"s | File: "+name,
-            )
-        }
-    }
-}
-
-// startPlayer is a helper to call play()
-func (m *Music) startPlayer(guild string, vc *discordgo.VoiceConnection, msg *discordgo.Message, session *discordgo.Session) {
-    defer helpers.RecoverDiscord(msg)
-
-    // Ignore call if already playing
-    if m.guildConnections[guild].playing {
-        return
-    }
-
-    // Get pointer to closer and controller via guildConnection
-    closer := &m.guildConnections[guild].closer
-    controller := &m.guildConnections[guild].controller
-    playlist := &m.guildConnections[guild].playlist
-
-    // Start eventloop
-    for {
-        // Exit if the closer channel closes
-        select {
-        case <-(*closer):
-            return
-        default:
-        }
-
-        // Do nothing until voice is ready and songs are queued
-        if !vc.Ready || len(*playlist) == 0 {
-            time.Sleep(1 * time.Second)
-            continue
-        }
-
-        // Mark guild as playing
-        m.guildConnections[guild].Lock()
-        m.guildConnections[guild].playing = true
-        m.guildConnections[guild].Unlock()
-
-        // Send data to discord
-        // Blocks until the song is done
-        m.play(vc, *closer, *controller, (*playlist)[0], msg, session)
-
-        // Remove song from playlist if it's not empty
-        if len(*playlist) > 0 {
-            m.guildConnections[guild].Lock()
-            *playlist = append((*playlist)[:0], (*playlist)[1:]...)
-            m.guildConnections[guild].Unlock()
-        }
-    }
-}
-
-// play is responsible for streaming the OPUS data to discord
-func (m *Music) play(
-    vc *discordgo.VoiceConnection,
-    closer <-chan struct{},
-    controller <-chan controlMessage,
-    song Song,
-    msg *discordgo.Message,
-    session *discordgo.Session,
-) {
-    // Mark as speaking
-    vc.Speaking(true)
-
-    // Mark as not speaking as soon as we're done
-    defer vc.Speaking(false)
-
-    // Read file
-    file, err := os.Open(song.Path)
-    helpers.Relax(err)
-    defer file.Close()
-
-    // Allocate opus header buffer
-    var opusLength int16
-
-    // Start eventloop
-    for {
-        // Exit if the closer channel closes
-        select {
-        case <-closer:
-            return
-        default:
-        }
-
-        // Listen for commands from controller
-        select {
-        case ctl := <-controller:
-            switch ctl {
-            case Skip:
-                return
-            case Pause:
-                wait := true
-                iteration := 0
-                session.ChannelMessageSend(msg.ChannelID, ":pause_button: Track paused")
-                for {
-                    // Read from controller channel
-                    ctl := <-controller
-                    switch ctl {
-                    case Skip:
-                        return
-                    case Resume:
-                        wait = false
-                    }
-
-                    // If Skip or Resume was received end lock
-                    if !wait {
-                        break
-                    }
-
-                    // Sleep for 0.5s until next check to reduce CPU load
-                    iteration++
-                    time.Sleep(500 * time.Millisecond)
-                }
-                session.ChannelMessageSend(msg.ChannelID, ":play_pause: Track resumed")
-            default:
-            }
-        default:
-        }
-
-        // Read opus frame length
-        err = binary.Read(file, binary.LittleEndian, &opusLength)
-        if err == io.EOF || err == io.ErrUnexpectedEOF {
-            return
-        }
-        helpers.Relax(err)
-
-        // Read audio data
-        opus := make([]byte, opusLength)
-        err = binary.Read(file, binary.LittleEndian, &opus)
-        if err == io.EOF || err == io.ErrUnexpectedEOF {
-            return
-        }
-        helpers.Relax(err)
-
-        // Send to discord
-        vc.OpusSend <- opus
-    }
-}
-
-// janitor watches the data dir and deletes files that don't belong there
-func (m *Music) janitor() {
-    defer helpers.Recover()
-
-    for {
-        // Query for songs
-        cursor, err := rethink.Table("music").Run(helpers.GetDB())
-        helpers.Relax(err)
-
-        // Get items
-        var songs []Song
-        err = cursor.All(&songs)
-        helpers.Relax(err)
-        cursor.Close()
-
-        // If there are no songs continue
-        if err == rethink.ErrEmptyResult || len(songs) == 0 {
-            continue
-        }
-
-        // Remove files that have to DB entry
-        dir, err := ioutil.ReadDir("/srv/karen-data")
-        helpers.Relax(err)
-
-        for _, file := range dir {
-            foundFile := false
-
-            for _, song := range songs {
-                if strings.Contains("/srv/karen-data/"+file.Name(), helpers.BtoA(song.URL)) {
-                    foundFile = true
-                    break
-                }
-            }
-
-            if !foundFile {
-                Logger.INFO.L("music", "[JANITOR] Removing "+file.Name())
-                err = os.Remove("/srv/karen-data/" + file.Name())
-                helpers.Relax(err)
-            }
-        }
-
-        time.Sleep(30 * time.Second)
-    }
-}
-
 // autoLeave disconnects from VC if the users leave anf forget to !leave
-func (m *Music) autoLeave(guildId string, channelId string, session *discordgo.Session, closer <-chan struct{}) {
+func (m *Module) autoLeave(guildId string, channelId string, session *discordgo.Session, closer <-chan struct{}) {
     defer helpers.Recover()
 
     for {
@@ -1023,4 +580,59 @@ func (m *Music) autoLeave(guildId string, channelId string, session *discordgo.S
 
         m.guildConnections[guildId].RUnlock()
     }
+}
+
+// Waits until the song is ready and notifies.
+func (m *Module) waitForSong(channel string, guild string, match Song, msg *discordgo.Message, session *discordgo.Session) {
+    defer helpers.RecoverDiscord(msg)
+
+    queue := &m.guildConnections[guild].queue
+    playlist := &m.guildConnections[guild].playlist
+
+    for {
+        time.Sleep(1 * time.Second)
+
+        cursor, err := rethink.Table("music").Filter(map[string]interface{}{"url": match.URL}).Run(helpers.GetDB())
+        helpers.Relax(err)
+
+        var res Song
+        err = cursor.One(&res)
+        helpers.Relax(err)
+        cursor.Close()
+
+        if res.Processed {
+            // Remove from queue
+            for idx, song := range *queue {
+                if song.URL == match.URL {
+                    m.guildConnections[guild].Lock()
+                    *queue = append((*queue)[:idx], (*queue)[idx+1:]...)
+                    m.guildConnections[guild].Unlock()
+                }
+            }
+
+            // Add to playlist
+            m.guildConnections[guild].Lock()
+            *playlist = append(*playlist, res)
+            m.guildConnections[guild].Unlock()
+
+            session.ChannelMessageSend(channel, ":ballot_box_with_check: `"+res.Title+"` finished downloading :smiley:")
+            break
+        }
+    }
+}
+
+// Resolves a voice channel relative to a user id
+func (m *Module) resolveVoiceChannel(user *discordgo.User, guild *discordgo.Guild, session *discordgo.Session) *discordgo.Channel {
+    for _, vs := range guild.VoiceStates {
+        if vs.UserID == user.ID {
+            channel, err := session.Channel(vs.ChannelID)
+            if err != nil {
+                return nil
+            }
+
+            return channel
+        }
+    }
+
+    return nil
 }
