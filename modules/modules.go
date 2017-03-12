@@ -3,7 +3,6 @@ package modules
 import (
     "git.lukas.moe/sn0w/Karen/modules/plugins"
     "git.lukas.moe/sn0w/Karen/modules/triggers"
-    "git.lukas.moe/sn0w/Karen/modules/plugins/music"
 )
 
 var (
@@ -23,7 +22,6 @@ var (
         &plugins.Leet{},
         &plugins.ListenDotMoe{},
         &plugins.Minecraft{},
-        &music.Module{},
         &plugins.Osu{},
         &plugins.Ping{},
         &plugins.RandomCat{},
