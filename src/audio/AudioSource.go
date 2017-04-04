@@ -9,7 +9,7 @@ type AudioSource interface {
     New() (error)
 
     // Free is expected to deallocate any in-use resources and stop all child-routines (if needed)
-    // This should also close the Provider() chan and set Ready() to false.
+    // This should also close the Provide() chan and set Ready() to false.
     Free() (error)
 
     // Provider has to return a chan that transfers pointers to the source's opus frames.

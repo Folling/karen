@@ -14,12 +14,12 @@ type AudioPlayer interface {
     // GetSource returns the currently active source
     GetSource() (*AudioSource, error)
 
-    // SetSource empties the current playlist and calls AddSource() afterwards
-    SetSource(source *AudioSource) (error)
-
     // PushSource adds a new AudioSource to this player's playlist
     PushSource(source *AudioSource) (error)
 
     // PopSource removes the first item from this playlist
     PopSource() (*AudioSource, error)
+
+    // SetSource empties the current playlist
+    ClearSources() (error)
 }

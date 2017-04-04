@@ -1,6 +1,6 @@
 package audio
 
-type ControlMessage int
+type ControlMessage uint8
 
 const (
     Stop ControlMessage = iota

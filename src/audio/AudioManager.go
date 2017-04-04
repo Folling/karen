@@ -12,10 +12,11 @@ type AudioManger struct {
 }
 
 func GetManager() (*AudioManger) {
+    instanceMutex.Lock()
+    defer instanceMutex.Unlock()
+
     if instance == nil {
-        instanceMutex.Lock()
         instance = &AudioManger{}
-        instanceMutex.Unlock()
     }
 
     return instance
