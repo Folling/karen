@@ -1,6 +1,6 @@
 package audio
 
-type AudioSource interface {
+type Source interface {
     // New allocates and initiates the audio source.
     // This might include connecting to a webradio or downloading a song.
     // The AudioPlayer will wait until Ready() returns true (i.e the source is able to Provide() Data).

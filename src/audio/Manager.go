@@ -4,29 +4,29 @@ import "sync"
 
 var (
     instanceMutex sync.RWMutex
-    instance *AudioManger
+    instance *Manager
 )
 
-type AudioManger struct {
+type Manager struct {
     connections map[string]*AudioPlayer
 }
 
-func GetManager() (*AudioManger) {
+func GetManager() (*Manager) {
     instanceMutex.Lock()
     defer instanceMutex.Unlock()
 
     if instance == nil {
-        instance = &AudioManger{}
+        instance = &Manager{}
     }
 
     return instance
 }
 
-func (m *AudioManger) JoinGuild(id string, player *AudioPlayer) {
+func (m *Manager) JoinGuild(id string, player *AudioPlayer) {
     panic("stub!")
 }
 
-func (m* AudioManger) LeaveGuild(id string) {
+func (m* Manager) LeaveGuild(id string) {
     panic("stub!")
 }
 
