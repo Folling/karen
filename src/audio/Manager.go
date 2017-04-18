@@ -8,7 +8,7 @@ var (
 )
 
 type Manager struct {
-    connections map[string]*AudioPlayer
+    connections map[string]*Player
 }
 
 func GetManager() (*Manager) {
@@ -22,7 +22,7 @@ func GetManager() (*Manager) {
     return instance
 }
 
-func (m *Manager) JoinGuild(id string, player *AudioPlayer) {
+func (m *Manager) JoinGuild(id string, player *Player) {
     panic("stub!")
 }
 
